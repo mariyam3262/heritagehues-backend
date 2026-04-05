@@ -55,26 +55,30 @@ def create_app():
     contact_messages = db.contact_messages
     pricing_settings = db.pricing_settings
     payment_settings = db.payment_settings
-
-    products.create_index([("slug", ASCENDING)], unique=True)
-    products.create_index([("updated_at", DESCENDING)])
-    carts.create_index([("session_id", ASCENDING)], unique=True)
-    carts.create_index([("updated_at", DESCENDING)])
-    orders.create_index([("order_ref", ASCENDING)], unique=True)
-    orders.create_index([("created_at", DESCENDING)])
-    order_status_history.create_index([("order_id", ASCENDING), ("timestamp", DESCENDING)])
-    contact_messages.create_index([("created_at", DESCENDING)])
     reviews = db.reviews
-    reviews.create_index([("product_slug", ASCENDING), ("created_at", DESCENDING)])
-    reviews.create_index([("created_at", DESCENDING)])
     users = db.users
     admins = db.admins
-    users.create_index([("email", ASCENDING)], unique=True)
-    users.create_index([("updated_at", DESCENDING)])
-    users.create_index([("joined_at", DESCENDING)])
-    admins.create_index([("email", ASCENDING)], unique=True)
-    admins.create_index([("created_at", DESCENDING)])
-    orders.update_many({"payment_id": None}, {"$unset": {"payment_id": ""}})
+
+    try:
+        products.create_index([("slug", ASCENDING)], unique=True)
+        products.create_index([("updated_at", DESCENDING)])
+        carts.create_index([("session_id", ASCENDING)], unique=True)
+        carts.create_index([("updated_at", DESCENDING)])
+        orders.create_index([("order_ref", ASCENDING)], unique=True)
+        orders.create_index([("created_at", DESCENDING)])
+        order_status_history.create_index([("order_id", ASCENDING), ("timestamp", DESCENDING)])
+        contact_messages.create_index([("created_at", DESCENDING)])
+        reviews.create_index([("product_slug", ASCENDING), ("created_at", DESCENDING)])
+        reviews.create_index([("created_at", DESCENDING)])
+        users.create_index([("email", ASCENDING)], unique=True)
+        users.create_index([("updated_at", DESCENDING)])
+        users.create_index([("joined_at", DESCENDING)])
+        admins.create_index([("email", ASCENDING)], unique=True)
+        admins.create_index([("created_at", DESCENDING)])
+
+    except Exception as e:
+        print(f"Warning: Could not create indexes: {e}")
+
     try:
         orders.drop_index("payment_id_1")
     except Exception:
