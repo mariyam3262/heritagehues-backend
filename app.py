@@ -31,6 +31,10 @@ from routes.admin_auth import admin_auth_bp, get_admin_csrf_token
 
 load_dotenv()
 
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def create_app():
     app = Flask(__name__)
@@ -39,8 +43,10 @@ def create_app():
     login_manager.login_view = None
     app.register_blueprint(admin_auth_bp)
 
-    upload_dir = Path(app.root_path) / "uploads"
+    upload_dir = UPLOAD_DIR
     upload_dir.mkdir(parents=True, exist_ok=True)
+    print("UPLOAD DIR:", upload_dir)
+    print("FILES:", [file.name for file in upload_dir.glob("*")])
     allowed_extensions = {"jpg", "jpeg", "png", "webp"}
 
     mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
@@ -425,7 +431,7 @@ def create_app():
         return ext in allowed_extensions
 
     def build_photo_url(filename):
-        return url_for("serve_upload", filename=filename, _external=False)
+        return f"/api/uploads/{filename}"
 
     def format_money(value):
         return round(float(value or 0), 2)
@@ -1781,9 +1787,20 @@ def create_app():
         docs = products.find().sort("updated_at", DESCENDING)
         return jsonify([format_product(doc) for doc in docs])
 
-    @app.get("/api/uploads/<path:filename>")
+    @app.get("/api/uploads/<filename>")
     def serve_upload(filename):
+        print("SERVE FILE:", filename, "FROM:", upload_dir)
+        print("FILES:", [file.name for file in upload_dir.glob("*")])
         return send_from_directory(upload_dir, filename)
+
+    @app.get("/api/debug/uploads")
+    def debug_uploads():
+        return jsonify(
+            {
+                "upload_dir": str(upload_dir),
+                "files": [file.name for file in upload_dir.glob("*")],
+            }
+        )
 
     @app.get("/api/products/<string:slug>")
     def get_product(slug):
@@ -2136,7 +2153,11 @@ def create_app():
 
             ext = filename.rsplit(".", 1)[1].lower()
             stored_name = f"{secrets.token_hex(12)}.{ext}"
-            file.save(upload_dir / stored_name)
+            file_path = upload_dir / stored_name
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            file.save(file_path)
+            print("SAVED PRODUCT PHOTO:", file_path, "EXISTS:", file_path.exists())
+            print("FILES:", [saved_file.name for saved_file in upload_dir.glob("*")])
             uploaded.append(build_photo_url(stored_name))
 
         return jsonify({"photos": uploaded}), 201
@@ -2155,7 +2176,11 @@ def create_app():
 
         ext = filename.rsplit(".", 1)[1].lower()
         stored_name = f"{secrets.token_hex(12)}.{ext}"
-        attachment.save(upload_dir / stored_name)
+        file_path = upload_dir / stored_name
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        attachment.save(file_path)
+        print("SAVED REVIEW ATTACHMENT:", file_path, "EXISTS:", file_path.exists())
+        print("FILES:", [saved_file.name for saved_file in upload_dir.glob("*")])
         return jsonify({"url": build_photo_url(stored_name)}), 201
 
     @app.post("/api/checkout/upi-intent")
