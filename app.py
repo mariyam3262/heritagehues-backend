@@ -43,10 +43,9 @@ def create_app():
     login_manager.login_view = None
     app.register_blueprint(admin_auth_bp)
 
-    upload_dir = UPLOAD_DIR
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    print("UPLOAD DIR:", upload_dir)
-    print("FILES:", [file.name for file in upload_dir.glob("*")])
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    print("UPLOAD DIR:", UPLOAD_DIR)
+    print("FILES:", [file.name for file in UPLOAD_DIR.glob("*")])
     allowed_extensions = {"jpg", "jpeg", "png", "webp"}
 
     mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
@@ -1789,16 +1788,19 @@ def create_app():
 
     @app.get("/api/uploads/<filename>")
     def serve_upload(filename):
-        print("SERVE FILE:", filename, "FROM:", upload_dir)
-        print("FILES:", [file.name for file in upload_dir.glob("*")])
-        return send_from_directory(upload_dir, filename)
+        print("SERVE FILE:", filename)
+        print("FROM DIR:", UPLOAD_DIR)
+        print("FILES:", [file.name for file in UPLOAD_DIR.glob("*")])
+        print("FULL PATH:", (UPLOAD_DIR / filename).resolve())
+        print("EXISTS:", (UPLOAD_DIR / filename).exists())
+        return send_from_directory(UPLOAD_DIR, filename)
 
     @app.get("/api/debug/uploads")
     def debug_uploads():
         return jsonify(
             {
-                "upload_dir": str(upload_dir),
-                "files": [file.name for file in upload_dir.glob("*")],
+                "upload_dir": str(UPLOAD_DIR),
+                "files": [file.name for file in UPLOAD_DIR.glob("*")],
             }
         )
 
@@ -2153,11 +2155,11 @@ def create_app():
 
             ext = filename.rsplit(".", 1)[1].lower()
             stored_name = f"{secrets.token_hex(12)}.{ext}"
-            file_path = upload_dir / stored_name
-            upload_dir.mkdir(parents=True, exist_ok=True)
+            file_path = UPLOAD_DIR / stored_name
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
             file.save(file_path)
             print("SAVED PRODUCT PHOTO:", file_path, "EXISTS:", file_path.exists())
-            print("FILES:", [saved_file.name for saved_file in upload_dir.glob("*")])
+            print("FILES:", [saved_file.name for saved_file in UPLOAD_DIR.glob("*")])
             uploaded.append(build_photo_url(stored_name))
 
         return jsonify({"photos": uploaded}), 201
@@ -2176,11 +2178,11 @@ def create_app():
 
         ext = filename.rsplit(".", 1)[1].lower()
         stored_name = f"{secrets.token_hex(12)}.{ext}"
-        file_path = upload_dir / stored_name
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        file_path = UPLOAD_DIR / stored_name
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         attachment.save(file_path)
         print("SAVED REVIEW ATTACHMENT:", file_path, "EXISTS:", file_path.exists())
-        print("FILES:", [saved_file.name for saved_file in upload_dir.glob("*")])
+        print("FILES:", [saved_file.name for saved_file in UPLOAD_DIR.glob("*")])
         return jsonify({"url": build_photo_url(stored_name)}), 201
 
     @app.post("/api/checkout/upi-intent")
