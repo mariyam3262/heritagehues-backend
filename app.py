@@ -1,5 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import base64
+import gzip
 import hashlib
 import hmac
 import json
@@ -16,20 +17,33 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from bson import ObjectId
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_from_directory, url_for
+
+load_dotenv()
+
+from flask import Flask, Response, abort, jsonify, request, send_from_directory, url_for
 from flask_cors import CORS
 from flask_login import current_user
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 from config import Config
 from extensions import login_manager
 from models import Admin
 from routes.admin_auth import admin_auth_bp, get_admin_csrf_token
-
-
-load_dotenv()
+from seo_utils import (
+    SITEMAP_URL,
+    SITEMAP_CACHE_SECONDS,
+    SITEMAP_MAX_URLS,
+    STATIC_SITEMAP_PAGES,
+    build_product_seo,
+    build_sitemap_index_xml,
+    build_sitemap_xml,
+    generate_unique_slug,
+    ping_google_sitemap_async,
+    slugify,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -39,6 +53,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
+    if os.getenv("TRUST_PROXY_HEADERS", "true").strip().lower() in {"1", "true", "yes"}:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
     login_manager.init_app(app)
     login_manager.login_view = None
     app.register_blueprint(admin_auth_bp)
@@ -63,6 +79,8 @@ def create_app():
     reviews = db.reviews
     users = db.users
     admins = db.admins
+    blogs = db.blogs
+    sitemap_cache = {}
 
     try:
         products.create_index([("slug", ASCENDING)], unique=True)
@@ -80,6 +98,12 @@ def create_app():
         users.create_index([("joined_at", DESCENDING)])
         admins.create_index([("email", ASCENDING)], unique=True)
         admins.create_index([("created_at", DESCENDING)])
+        blogs.create_index(
+            [("slug", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"slug": {"$exists": True, "$type": "string"}},
+        )
+        blogs.create_index([("updated_at", DESCENDING)])
 
     except Exception as e:
         print(f"Warning: Could not create indexes: {e}")
@@ -120,6 +144,13 @@ def create_app():
 
     @app.before_request
     def protect_admin_endpoints():
+        if request.path in {
+            "/sitemap.xml",
+            "/sitemap-static.xml",
+            "/robots.txt",
+        } or request.path.startswith(("/sitemap-products-", "/sitemap-blogs-")):
+            return None
+
         if request.method == "OPTIONS":
             return None
 
@@ -418,10 +449,27 @@ def create_app():
         
         return result
 
+    def format_product_with_seo(doc):
+        product = format_product(doc)
+        seo = build_product_seo(product)
+        product["seo"] = seo["meta"]
+        product["structured_data"] = seo["structured_data"]
+        product["json_ld"] = seo["json_ld"]
+        return product
+
     def sanitize_slug(value):
-        raw = (value or "").strip().lower()
-        cleaned = "-".join("".join(ch if ch.isalnum() else " " for ch in raw).split())
-        return cleaned
+        return slugify(value)
+
+    def make_unique_product_slug(value, current_product_id=None):
+        current_id = str(current_product_id or "").strip()
+
+        def slug_exists(candidate):
+            doc = products.find_one({"slug": candidate}, {"_id": 1})
+            if not doc:
+                return False
+            return str(doc.get("_id")) != current_id
+
+        return generate_unique_slug(value, slug_exists)
 
     def is_allowed_file(filename):
         if "." not in filename:
@@ -1103,6 +1151,172 @@ def create_app():
     @app.get("/api/health")
     def health():
         return jsonify({"status": "ok"})
+
+    def build_static_sitemap_entries():
+        now = datetime.now(timezone.utc)
+        return [
+            {
+                "loc": page["path"],
+                "lastmod": now,
+                "priority": page["priority"],
+            }
+            for page in STATIC_SITEMAP_PAGES
+        ]
+
+    def build_blog_sitemap_entries(page=None):
+        cursor = blogs.find(
+            {"slug": {"$exists": True, "$ne": ""}},
+            {"slug": 1, "updated_at": 1},
+        ).sort("updated_at", DESCENDING)
+        if page is not None:
+            cursor = cursor.skip((page - 1) * SITEMAP_MAX_URLS).limit(SITEMAP_MAX_URLS)
+        return [
+            {
+                "loc": f"/blog/{sanitize_slug(blog.get('slug'))}",
+                "lastmod": blog.get("updated_at"),
+                "priority": "0.7",
+            }
+            for blog in cursor.batch_size(1000)
+        ]
+
+    def build_product_sitemap_entries(page=None):
+        cursor = products.find(
+            {"slug": {"$exists": True, "$ne": ""}},
+            {"slug": 1, "updated_at": 1},
+        ).sort("updated_at", DESCENDING)
+        if page is not None:
+            cursor = cursor.skip((page - 1) * SITEMAP_MAX_URLS).limit(SITEMAP_MAX_URLS)
+        return [
+            {
+                "loc": f"/product/{sanitize_slug(product.get('slug'))}",
+                "lastmod": product.get("updated_at"),
+                "priority": "0.9",
+            }
+            for product in cursor.batch_size(1000)
+        ]
+
+    def build_sitemap_entries():
+        return build_static_sitemap_entries() + build_blog_sitemap_entries() + build_product_sitemap_entries()
+
+    def build_sitemap_index_entries():
+        now = datetime.now(timezone.utc)
+        entries = [{"loc": "/sitemap-static.xml", "lastmod": now}]
+        blog_count = blogs.count_documents({"slug": {"$exists": True, "$ne": ""}})
+        product_count = products.count_documents({"slug": {"$exists": True, "$ne": ""}})
+
+        for page in range(1, (blog_count + SITEMAP_MAX_URLS - 1) // SITEMAP_MAX_URLS + 1):
+            entries.append({"loc": f"/sitemap-blogs-{page}.xml", "lastmod": now})
+        for page in range(1, (product_count + SITEMAP_MAX_URLS - 1) // SITEMAP_MAX_URLS + 1):
+            entries.append({"loc": f"/sitemap-products-{page}.xml", "lastmod": now})
+
+        return entries
+
+    def invalidate_sitemap_cache():
+        sitemap_cache.clear()
+
+    def get_cached_sitemap(cache_key):
+        cached = sitemap_cache.get(cache_key)
+        if not cached:
+            return None
+        if cached["expires_at"] <= datetime.now(timezone.utc):
+            sitemap_cache.pop(cache_key, None)
+            return None
+        return cached["xml"], cached["generated_at"]
+
+    def set_cached_sitemap(cache_key, xml):
+        generated_at = datetime.now(timezone.utc)
+        sitemap_cache[cache_key] = {
+            "xml": xml,
+            "generated_at": generated_at,
+            "expires_at": generated_at + timedelta(seconds=SITEMAP_CACHE_SECONDS),
+        }
+        return xml, generated_at
+
+    def make_sitemap_response(xml, generated_at=None):
+        generated_at = generated_at or datetime.now(timezone.utc)
+        body = xml.encode("utf-8")
+        use_gzip = "gzip" in request.headers.get("Accept-Encoding", "").lower()
+        response_body = gzip.compress(body) if use_gzip else body
+        response = Response(response_body, mimetype="application/xml")
+        response.headers["Cache-Control"] = f"public, max-age={SITEMAP_CACHE_SECONDS}, s-maxage={SITEMAP_CACHE_SECONDS}"
+        response.headers["Content-Type"] = "application/xml; charset=utf-8"
+        response.headers["Last-Modified"] = generated_at.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        response.headers["X-Robots-Tag"] = "all"
+        response.headers["Vary"] = "Accept-Encoding"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Length"] = str(len(response_body))
+        response.set_etag(hashlib.sha256(body).hexdigest())
+        if use_gzip:
+            response.headers["Content-Encoding"] = "gzip"
+        return response
+
+    def cached_sitemap_response(cache_key, builder):
+        cached = get_cached_sitemap(cache_key)
+        if cached:
+            return make_sitemap_response(*cached)
+        try:
+            xml = builder()
+        except Exception:
+            app.logger.exception("Failed to generate sitemap: %s", cache_key)
+            return jsonify({"error": "Failed to generate sitemap"}), 500
+        return make_sitemap_response(*set_cached_sitemap(cache_key, xml))
+
+    @app.get("/sitemap.xml")
+    def sitemap_xml():
+        def build_root_sitemap():
+            total_urls = (
+                len(STATIC_SITEMAP_PAGES)
+                + blogs.count_documents({"slug": {"$exists": True, "$ne": ""}})
+                + products.count_documents({"slug": {"$exists": True, "$ne": ""}})
+            )
+            if total_urls > SITEMAP_MAX_URLS:
+                return build_sitemap_index_xml(build_sitemap_index_entries())
+            return build_sitemap_xml(build_sitemap_entries())
+
+        return cached_sitemap_response("root", build_root_sitemap)
+
+    @app.get("/sitemap-static.xml")
+    def sitemap_static_xml():
+        return cached_sitemap_response(
+            "static",
+            lambda: build_sitemap_xml(build_static_sitemap_entries()),
+        )
+
+    @app.get("/sitemap-blogs-<int:page>.xml")
+    def sitemap_blogs_xml(page):
+        if page < 1:
+            abort(404)
+        return cached_sitemap_response(
+            f"blogs:{page}",
+            lambda: build_sitemap_xml(build_blog_sitemap_entries(page=page)),
+        )
+
+    @app.get("/sitemap-products-<int:page>.xml")
+    def sitemap_products_xml(page):
+        if page < 1:
+            abort(404)
+        return cached_sitemap_response(
+            f"products:{page}",
+            lambda: build_sitemap_xml(build_product_sitemap_entries(page=page)),
+        )
+
+    @app.get("/robots.txt")
+    def robots_txt():
+        content = "\n".join(
+            [
+                "User-agent: *",
+                "Allow: /",
+                "Disallow: /admin/",
+                "Disallow: /dashboard/",
+                f"Sitemap: {SITEMAP_URL}",
+                "",
+            ]
+        )
+        response = Response(content, mimetype="text/plain")
+        response.headers["Cache-Control"] = f"public, max-age={SITEMAP_CACHE_SECONDS}, s-maxage={SITEMAP_CACHE_SECONDS}"
+        response.headers["X-Robots-Tag"] = "all"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     @app.post("/api/contact")
     def submit_contact():
@@ -1809,7 +2023,14 @@ def create_app():
         doc = products.find_one({"slug": sanitize_slug(slug)})
         if not doc:
             return jsonify({"error": "Product not found"}), 404
-        return jsonify(format_product(doc))
+        return jsonify(format_product_with_seo(doc))
+
+    @app.get("/product/<string:slug>")
+    def get_product_page_data(slug):
+        doc = products.find_one({"slug": sanitize_slug(slug)})
+        if not doc:
+            return jsonify({"error": "Product not found"}), 404
+        return jsonify(format_product_with_seo(doc))
 
     @app.get("/api/products/<string:slug>/reviews")
     def get_product_reviews(slug):
@@ -2029,6 +2250,7 @@ def create_app():
         data, error = validate_payload(payload, partial=False)
         if error:
             return jsonify({"error": error}), 400
+        data["slug"] = make_unique_product_slug(data.get("slug") or data.get("title"))
         
         # Auto-calculate prices
         try:
@@ -2064,6 +2286,8 @@ def create_app():
             return jsonify({"error": "A product with this slug already exists"}), 409
 
         created = products.find_one({"_id": result.inserted_id})
+        invalidate_sitemap_cache()
+        ping_google_sitemap_async()
         return jsonify(format_product(created)), 201
 
     @app.put("/api/admin/products/<string:product_id>")
@@ -2085,6 +2309,8 @@ def create_app():
         existing = products.find_one({"_id": oid})
         if not existing:
             return jsonify({"error": "Product not found"}), 404
+        if "slug" in data:
+            data["slug"] = make_unique_product_slug(data["slug"], current_product_id=oid)
 
         # Recalculate if pricing inputs changed
         if {"cost_price", "packaging_cost", "delivery_cost", "discount_percentage"} & set(data.keys()):
@@ -2122,6 +2348,7 @@ def create_app():
         if not updated:
             return jsonify({"error": "Product not found"}), 404
 
+        invalidate_sitemap_cache()
         return jsonify(format_product(updated))
 
     @app.delete("/api/admin/products/<string:product_id>")
@@ -2135,6 +2362,7 @@ def create_app():
         if result.deleted_count == 0:
             return jsonify({"error": "Product not found"}), 404
 
+        invalidate_sitemap_cache()
         return jsonify({"message": "Product deleted"})
 
     @app.post("/api/admin/uploads")
