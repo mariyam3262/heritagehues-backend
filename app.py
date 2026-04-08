@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -20,8 +21,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from flask import Flask, Response, abort, jsonify, request, send_from_directory, url_for
-from flask_cors import CORS
+from flask import Flask, Response, abort, jsonify, make_response, request, send_from_directory, url_for
+from flask_cors import CORS, cross_origin
 from flask_login import current_user
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
@@ -2001,13 +2002,22 @@ def create_app():
         return jsonify([format_product(doc) for doc in docs])
 
     @app.get("/api/uploads/<filename>")
+    @cross_origin()  # ✅ important
     def serve_upload(filename):
+        file_path = UPLOAD_DIR / filename
+
         print("SERVE FILE:", filename)
-        print("FROM DIR:", UPLOAD_DIR)
-        print("FILES:", [file.name for file in UPLOAD_DIR.glob("*")])
-        print("FULL PATH:", (UPLOAD_DIR / filename).resolve())
-        print("EXISTS:", (UPLOAD_DIR / filename).exists())
-        return send_from_directory(UPLOAD_DIR, filename)
+        print("FULL PATH:", file_path.resolve())
+        print("EXISTS:", file_path.exists())
+
+        if not file_path.exists():
+            return {"error": "File not found"}, 404
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+
+        response = make_response(send_from_directory(UPLOAD_DIR, filename))
+        response.headers["Content-Type"] = mime_type or "application/octet-stream"
+        response.headers["Access-Control-Allow-Origin"] = "*"
 
     @app.get("/api/debug/uploads")
     def debug_uploads():
