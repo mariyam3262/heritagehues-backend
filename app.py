@@ -201,16 +201,12 @@ def create_app():
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
-
-        if response.content_type and response.content_type.startswith("application/json") and should_encrypt_response():
-            payload = response.get_json(silent=True)
-            if payload is not None:
-                encrypted_payload = encrypt_json_payload(payload)
-                if encrypted_payload is not None:
-                    response.set_data(json.dumps(encrypted_payload))
-                    response.headers["Content-Type"] = "application/json"
-                    response.headers["Content-Length"] = str(len(response.get_data()))
-        return response
+        
+        # Add this — allows images to load cross-origin
+        if response.content_type and response.content_type.startswith("image/"):
+            response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+        
+        # ... rest of your existing code
 
     def get_stock_count(doc):
         raw_stock = doc.get("stock_count")
@@ -2004,19 +2000,19 @@ def create_app():
         docs = products.find().sort("updated_at", DESCENDING)
         return jsonify([format_product(doc) for doc in docs])
 
-
     @app.get("/api/uploads/<filename>")
     def serve_upload(filename):
         file_path = UPLOAD_DIR / filename
 
-        print("SERVE FILE:", filename)
-        print("FULL PATH:", file_path.resolve())
-        print("EXISTS:", file_path.exists())
-
         if not file_path.exists():
             return jsonify({"error": "File not found"}), 404
 
-        return send_file(file_path)
+        # Explicitly detect and pass the mimetype
+        mimetype, _ = mimetypes.guess_type(str(file_path))
+        if not mimetype:
+            mimetype = "application/octet-stream"
+
+        return send_file(file_path, mimetype=mimetype)
 
     @app.get("/api/debug/uploads")
     def debug_uploads():
