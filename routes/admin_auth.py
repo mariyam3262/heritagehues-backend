@@ -1,7 +1,11 @@
+import base64
+import hashlib
+import os
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import Blueprint, current_app, jsonify, request, session
 from flask_login import current_user, login_required, login_user, logout_user
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -87,6 +91,41 @@ def validate_password(value):
     return password
 
 
+def get_admin_login_encryption_key():
+    key_source = (
+        os.getenv("ADMIN_LOGIN_ENCRYPTION_KEY", "").strip()
+        or os.getenv("VITE_ADMIN_LOGIN_ENCRYPTION_KEY", "").strip()
+    )
+    if not key_source:
+        return None
+    return hashlib.sha256(key_source.encode()).digest()
+
+
+def decrypt_admin_login_value(value):
+    encrypted_value = str(value or "").strip()
+    if not encrypted_value:
+        return ""
+
+    key = get_admin_login_encryption_key()
+    if not key:
+        raise ValueError("Admin login encryption key is not configured")
+
+    try:
+        raw = base64.urlsafe_b64decode(encrypted_value.encode())
+        nonce, ciphertext = raw[:12], raw[12:]
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+        return plaintext.decode().strip()
+    except Exception as exc:
+        raise ValueError("Invalid encrypted password") from exc
+
+
+def get_login_password(payload):
+    encrypted_password = payload.get("password_encrypted")
+    if encrypted_password is not None:
+        return decrypt_admin_login_value(encrypted_password)
+    return str(payload.get("password", ""))
+
+
 def hash_password(password):
     return generate_password_hash(password)
 
@@ -160,7 +199,6 @@ def login_admin():
     payload = request.get_json(silent=True) or {}
     collection = admins_collection()
     email = str(payload.get("email", "")).strip().lower()
-    password = str(payload.get("password", ""))
     remember = bool(payload.get("remember_me", False))
 
     if is_rate_limited(email):
@@ -168,6 +206,7 @@ def login_admin():
 
     try:
         email = validate_email(email)
+        password = get_login_password(payload)
         if not password:
             raise ValueError("Password is required")
     except ValueError as exc:
