@@ -121,7 +121,10 @@ def create_app():
     )
     app.extensions["admins_collection"] = admins
 
-    cors_origins = os.getenv("CORS_ORIGINS", "https://heritagehues.net","http://localhost:5173,http://localhost:5174,http://localhost:4173")
+    cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "https://heritagehues.net,http://localhost:5173,http://localhost:5174,http://localhost:4173"
+    )
     allowed_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
     CORS(
         app,
@@ -2494,4 +2497,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
