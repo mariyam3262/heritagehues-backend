@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from flask import Flask, Response, abort, jsonify, make_response, request, send_from_directory, url_for
+from flask import Flask, Response, abort, jsonify, make_response, request, send_file, url_for
 from flask_cors import CORS, cross_origin
 from flask_login import current_user
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -121,7 +121,7 @@ def create_app():
     )
     app.extensions["admins_collection"] = admins
 
-    cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:5174,http://localhost:4173")
+    cors_origins = os.getenv("CORS_ORIGINS", "https://heritagehues.net","http://localhost:5173,http://localhost:5174,http://localhost:4173")
     allowed_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
     CORS(
         app,
@@ -2001,8 +2001,8 @@ def create_app():
         docs = products.find().sort("updated_at", DESCENDING)
         return jsonify([format_product(doc) for doc in docs])
 
+
     @app.get("/api/uploads/<filename>")
-    @cross_origin()  # ✅ important
     def serve_upload(filename):
         file_path = UPLOAD_DIR / filename
 
@@ -2011,13 +2011,9 @@ def create_app():
         print("EXISTS:", file_path.exists())
 
         if not file_path.exists():
-            return {"error": "File not found"}, 404
+            return jsonify({"error": "File not found"}), 404
 
-        mime_type, _ = mimetypes.guess_type(file_path)
-
-        response = make_response(send_from_directory(UPLOAD_DIR, filename))
-        response.headers["Content-Type"] = mime_type or "application/octet-stream"
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        return send_file(file_path)
 
     @app.get("/api/debug/uploads")
     def debug_uploads():
