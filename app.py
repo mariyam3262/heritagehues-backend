@@ -737,6 +737,8 @@ def create_app():
     def update_order_fulfillment_status(order_doc, status, note="", tracking_id=None, tracking_url=None):
         if status not in FULFILLMENT_STATUSES:
             raise ValueError("Invalid order status")
+        if status == "cancelled" and order_doc.get("status") != "cancelled":
+            order_doc = restore_order_stock_if_needed(order_doc)
         updates = {
             "status":            status,
             "status_updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1287,7 +1289,7 @@ def create_app():
         return make_sitemap_response(*set_cached_sitemap(cache_key, xml))
 
     # ------------------------------------------------------------------
-    # Stock deduction helper (shared by razorpay + upi approval)
+    # Stock deduction helper
     # ------------------------------------------------------------------
     def deduct_stock(order_items: list):
         """Validate stock then atomically deduct. Raises ValueError on insufficient stock."""
@@ -1298,11 +1300,67 @@ def create_app():
             if _safe_int(item.get("quantity")) > get_stock_count(doc):
                 raise ValueError(f"Insufficient stock for {doc.get('title', 'product')}")
         for item in order_items:
-            products.find_one_and_update(
+            updated = products.find_one_and_update(
                 {"_id": ObjectId(item["product_id"])},
                 {"$inc": {"stock_count": -_safe_int(item["quantity"])},
                  "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}},
+                return_document=ReturnDocument.AFTER,
             )
+            if updated:
+                remaining_stock = get_stock_count(updated)
+                products.update_one(
+                    {"_id": updated["_id"]},
+                    {"$set": {"is_out_of_stock": remaining_stock <= 0}},
+                )
+
+    def restore_stock(order_items: list):
+        """Restore previously deducted stock back to inventory."""
+        for item in order_items:
+            doc = products.find_one({"_id": ObjectId(item["product_id"])})
+            if not doc:
+                continue
+            updated = products.find_one_and_update(
+                {"_id": doc["_id"]},
+                {"$inc": {"stock_count": _safe_int(item["quantity"])},
+                 "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated:
+                remaining_stock = get_stock_count(updated)
+                products.update_one(
+                    {"_id": updated["_id"]},
+                    {"$set": {"is_out_of_stock": remaining_stock <= 0}},
+                )
+
+    def ensure_order_stock_deducted(order_doc: dict) -> dict:
+        if bool(order_doc.get("stock_deducted")):
+            return order_doc
+        deduct_stock(order_doc.get("items", []))
+        return orders.find_one_and_update(
+            {"_id": order_doc["_id"]},
+            {
+                "$set": {
+                    "stock_deducted": True,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def restore_order_stock_if_needed(order_doc: dict) -> dict:
+        if not bool(order_doc.get("stock_deducted")):
+            return order_doc
+        restore_stock(order_doc.get("items", []))
+        return orders.find_one_and_update(
+            {"_id": order_doc["_id"]},
+            {
+                "$set": {
+                    "stock_deducted": False,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
 
     def clear_cart_after_payment(session_id: str):
         carts.update_one(
@@ -1794,6 +1852,7 @@ def create_app():
             "tracking_url":    "",
             "payment_provider": payment_provider,
             "payment_status":  "pending",
+            "stock_deducted":  False,
             "created_at":      now,
             "updated_at":      now,
         }
@@ -1817,9 +1876,11 @@ def create_app():
                 summary, sid, address, user_identity, "razorpay",
                 extra={"payment_status": "pending", "payment_order_id": rz_order.get("id")},
             )
+            deduct_stock(order_doc["items"])
+            order_doc["stock_deducted"] = True
             orders.insert_one(order_doc)
             created = orders.find_one({"order_ref": order_ref})
-            create_status_history_entry(created["_id"], "pending", "Order created")
+            create_status_history_entry(created["_id"], "pending", "Order created and stock deducted")
             return jsonify({
                 "order_id": str(created["_id"]), "order_ref": order_ref,
                 "total_amount": summary["total_amount"], "currency": summary["currency"],
@@ -1856,9 +1917,11 @@ def create_app():
                 summary, sid, address, user_identity, "upi",
                 extra={"payment_status": "payment_pending"},
             )
+            deduct_stock(order_doc["items"])
+            order_doc["stock_deducted"] = True
             orders.insert_one(order_doc)
             created = orders.find_one({"order_ref": order_ref})
-            create_status_history_entry(created["_id"], "pending", "Order created")
+            create_status_history_entry(created["_id"], "pending", "Order created and stock deducted")
             return jsonify({
                 "order_id": str(created["_id"]), "order_ref": order_ref,
                 "total_amount": summary["total_amount"], "currency": summary["currency"],
@@ -1943,7 +2006,7 @@ def create_app():
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         try:
-            deduct_stock(order.get("items", []))
+            order = ensure_order_stock_deducted(order)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         updated = orders.find_one_and_update(
@@ -2025,6 +2088,8 @@ def create_app():
             return jsonify({"error": "Order not found"}), 404
         if bool(order.get("is_deleted")):
             return jsonify({"error": "Order is already deleted"}), 400
+        if order.get("payment_status") != "paid":
+            order = restore_order_stock_if_needed(order)
         now = datetime.now(timezone.utc).isoformat()
         updated = orders.find_one_and_update(
             {"_id": oid},
@@ -2050,7 +2115,7 @@ def create_app():
         if order.get("payment_status") != "verification_pending":
             return jsonify({"error": "Order is not awaiting verification"}), 400
         try:
-            deduct_stock(order.get("items", []))
+            order = ensure_order_stock_deducted(order)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         updated = orders.find_one_and_update(

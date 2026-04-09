@@ -87,6 +87,29 @@ def validate_password(value):
     return password
 
 
+def hash_password(password):
+    return generate_password_hash(password)
+
+
+def verify_password(stored_password, provided_password):
+    stored_value = str(stored_password or "")
+    provided_value = str(provided_password or "")
+    if not stored_value or not provided_value:
+        return False, False
+
+    try:
+        if check_password_hash(stored_value, provided_value):
+            return True, False
+    except ValueError:
+        pass
+
+    # Compatibility for legacy plain-text records; we re-hash after login.
+    if secrets.compare_digest(stored_value, provided_value):
+        return True, True
+
+    return False, False
+
+
 @admin_auth_bp.post("/admin/register")
 def register_admin():
     payload = request.get_json(silent=True) or {}
@@ -116,7 +139,7 @@ def register_admin():
     admin_doc = {
         "name": name,
         "email": email,
-        "password": generate_password_hash(password),
+        "password": hash_password(password),
         "role": role,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -150,10 +173,28 @@ def login_admin():
     except ValueError as exc:
         return _json_error(str(exc), 400)
 
-    admin = Admin.from_document(collection.find_one({"email": email}))
-    if not admin or not check_password_hash(admin.password, password):
+    admin_doc = collection.find_one({"email": email})
+    admin = Admin.from_document(admin_doc)
+    if not admin:
         record_failed_attempt(email)
         return _json_error("Invalid email or password", 401)
+
+    password_matches, needs_upgrade = verify_password(admin.password, password)
+    if not password_matches:
+        record_failed_attempt(email)
+        return _json_error("Invalid email or password", 401)
+
+    if needs_upgrade:
+        collection.update_one(
+            {"_id": admin_doc["_id"]},
+            {
+                "$set": {
+                    "password": hash_password(password),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        admin = Admin.from_document(collection.find_one({"_id": admin_doc["_id"]}))
 
     clear_failed_attempts(email)
     session.clear()
