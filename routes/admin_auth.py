@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -14,6 +15,7 @@ from models import Admin
 
 
 admin_auth_bp = Blueprint("admin_auth", __name__)
+logger = logging.getLogger(__name__)
 
 _login_attempts = {}
 
@@ -91,14 +93,41 @@ def validate_password(value):
     return password
 
 
+def _iter_admin_login_encryption_keys():
+    seen = set()
+    key_sources = [
+        os.getenv("ADMIN_LOGIN_ENCRYPTION_KEY", "").strip(),
+        os.getenv("VITE_ADMIN_LOGIN_ENCRYPTION_KEY", "").strip(),
+        os.getenv("SECRET_KEY", "").strip(),
+        os.getenv("FLASK_SECRET_KEY", "").strip(),
+        os.getenv("API_ENCRYPTION_KEY", "").strip(),
+        os.getenv("ENCRYPTION_KEY", "").strip(),
+    ]
+
+    for key_source in key_sources:
+        if not key_source:
+            continue
+
+        # Preferred format shared by the frontend: SHA-256 of the configured secret string.
+        digest_key = hashlib.sha256(key_source.encode()).digest()
+        if digest_key not in seen:
+            seen.add(digest_key)
+            yield digest_key
+
+        # Backward/ops compatibility: also accept direct AES keys supplied as base64.
+        try:
+            padded = key_source + ("=" * (-len(key_source) % 4))
+            decoded = base64.urlsafe_b64decode(padded.encode())
+        except Exception:
+            continue
+
+        if len(decoded) in {16, 24, 32} and decoded not in seen:
+            seen.add(decoded)
+            yield decoded
+
+
 def get_admin_login_encryption_key():
-    key_source = (
-        os.getenv("ADMIN_LOGIN_ENCRYPTION_KEY", "").strip()
-        or os.getenv("VITE_ADMIN_LOGIN_ENCRYPTION_KEY", "").strip()
-    )
-    if not key_source:
-        return None
-    return hashlib.sha256(key_source.encode()).digest()
+    return next(_iter_admin_login_encryption_keys(), None)
 
 
 def decrypt_admin_login_value(value):
@@ -106,17 +135,28 @@ def decrypt_admin_login_value(value):
     if not encrypted_value:
         return ""
 
-    key = get_admin_login_encryption_key()
-    if not key:
+    if get_admin_login_encryption_key() is None:
         raise ValueError("Admin login encryption key is not configured")
 
     try:
-        raw = base64.urlsafe_b64decode(encrypted_value.encode())
+        padded_value = encrypted_value + ("=" * (-len(encrypted_value) % 4))
+        print(padded_value, "padded_value>>>>>>>>>>>>>>>>..")
+        raw = base64.urlsafe_b64decode(padded_value.encode())
+        if len(raw) < 13:
+            raise ValueError("Encrypted password payload is too short")
         nonce, ciphertext = raw[:12], raw[12:]
-        plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
-        return plaintext.decode().strip()
     except Exception as exc:
         raise ValueError("Invalid encrypted password") from exc
+
+    for key in _iter_admin_login_encryption_keys():
+        try:
+            plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+            return plaintext.decode().strip()
+        except Exception:
+            continue
+
+    logger.warning("Admin login password decryption failed for all configured key candidates")
+    raise ValueError("Invalid encrypted password")
 
 
 def get_login_password(payload):
