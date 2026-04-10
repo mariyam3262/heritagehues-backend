@@ -1,4 +1,5 @@
 import base64
+import binascii
 import hashlib
 import logging
 import os
@@ -81,7 +82,7 @@ def validate_email(value):
     email = str(value or "").strip().lower()
     if not email:
         raise ValueError("Email is required")
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+    if not re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", email):
         raise ValueError("Please enter a valid email address")
     return email
 
@@ -139,19 +140,21 @@ def decrypt_admin_login_value(value):
         raise ValueError("Admin login encryption key is not configured")
 
     try:
-        padded_value = encrypted_value + ("=" * (-len(encrypted_value) % 4))
-        print(padded_value, "padded_value>>>>>>>>>>>>>>>>..")
+        normalized_value = encrypted_value.replace(" ", "+")
+        padded_value = normalized_value + ("=" * (-len(normalized_value) % 4))
         raw = base64.urlsafe_b64decode(padded_value.encode())
         if len(raw) < 13:
             raise ValueError("Encrypted password payload is too short")
         nonce, ciphertext = raw[:12], raw[12:]
-    except Exception as exc:
+    except (binascii.Error, ValueError, TypeError) as exc:
         raise ValueError("Invalid encrypted password") from exc
 
     for key in _iter_admin_login_encryption_keys():
         try:
             plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
-            return plaintext.decode().strip()
+            decoded_password = plaintext.decode().strip()
+            logger.info("Admin login password decrypted successfully (length=%s)", len(decoded_password))
+            return decoded_password
         except Exception:
             continue
 
@@ -249,17 +252,24 @@ def login_admin():
         password = get_login_password(payload)
         if not password:
             raise ValueError("Password is required")
+        logger.info("Admin login parsed email=%s password_length=%s", email, len(password))
     except ValueError as exc:
         return _json_error(str(exc), 400)
 
     admin_doc = collection.find_one({"email": email})
     admin = Admin.from_document(admin_doc)
     if not admin:
+        logger.warning("Admin login failed: admin not found for email=%s", email)
         record_failed_attempt(email)
         return _json_error("Invalid email or password", 401)
 
     password_matches, needs_upgrade = verify_password(admin.password, password)
     if not password_matches:
+        logger.warning(
+            "Admin login failed: password mismatch for email=%s stored_password_prefix=%s",
+            email,
+            str(admin.password or "")[:20],
+        )
         record_failed_attempt(email)
         return _json_error("Invalid email or password", 401)
 
