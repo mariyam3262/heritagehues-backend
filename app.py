@@ -17,6 +17,14 @@ import smtplib
 from email.message import EmailMessage
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+)
 
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -576,20 +584,18 @@ def create_app():
         return f"/api/uploads/{filename}"
 
     def save_upload(file) -> str:
-        """Validate, store a single upload, return its public URL."""
         filename = secure_filename(file.filename or "")
         if not filename:
             raise ValueError("Invalid file name")
         if not is_allowed_file(filename):
             raise ValueError("Only jpg, jpeg, png, and webp files are allowed")
-        ext = filename.rsplit(".", 1)[1].lower()
-        stored_name = f"{secrets.token_hex(12)}.{ext}"
-        file_path = UPLOAD_DIR / stored_name
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        file.save(file_path)
-        logger.info("Saved upload: %s", file_path)
-        return build_photo_url(stored_name)
-
+        
+        result = cloudinary.uploader.upload(
+            file,
+            folder="heritage_hues",
+            resource_type="image",
+        )
+        return result["secure_url"]  # ← permanent HTTPS URL, kabhi expire nahi hoga
     # ------------------------------------------------------------------
     # Money helpers
     # ------------------------------------------------------------------
